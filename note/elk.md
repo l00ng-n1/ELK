@@ -336,7 +336,50 @@ systemctl restart elasticsearch
 curl 10.0.0.222:9200/_cat/nodes
 ```
 
+## Elasticsearch 集群扩容和缩容
 
+### 集群扩容
+
+新节点
+
+```shell
+vim /etc/elasticsearch/elasticsearch
+cluster.name: my-application #和原集群名称相同
+node.name: node4  #第二个新节点为node5
+network.host: 0.0.0.0
+#指定任意集群节点即可
+discovery.seed_hosts: ["10.0.0.222","10.0.0.223","10.0.0.224"]
+# 以下配置（选配）
+# ELasticsearch8.x开始，使用新方式指定节点角色
+# 如果是master节点
+node.roles: [master]
+# 如果是Data节点
+node.roles: [data]
+# 如果节点同时是 Master 和 Data 节点：
+node.roles: [master, data]
+# 如果节点是 Coordinating-only 节点（不存储数据也不当选主节点，仅用于查询分发）
+#如果改为路由节点，需要先执行/usr/share/elasticsearch/bin/elasticsearch-node repurpose 清理数据
+node.roles: []
+
+systemctl restart elasticsearch.service
+```
+
+### 集群缩容
+
+从集群中删除两个节点node4和node5，在两个节点按一定的顺序逐个停止服务，即可自动退出集群
+
+注意：停止服务前，要观察索引的情况，按一定顺序关机，防止数据丢失
+
+就是要注意：同一个节点上，不能有相同的分片
+停服务的时候，要注意保证先把该节点上独有的分片，复制到其他集群节点上后，在删除该节点
+
+**缺点关停的节点上的主分片在其他节点上有副本。**
+
+节点一个个关停，要等待集群内的分片不缺少，
+
+比如分片1的主分片与副本都在node3与node5上，就不能同时关停3，5.否则数据会缺失
+
+![image-20250121204518014](pic/image-20250121204518014.png)
 
 ## 优化ELK资源配置
 
@@ -429,3 +472,393 @@ systemctl start cerebro.service
 ![image-20250313182955013](pic/image-20250313182955013.png)
 
 ## ELasticsearch API访问
+
+**可以用三种方式和 Elasticsearch进行交互**
+
+-   **curl 命令**和其它浏览器: 基于命令行,操作不方便
+-   **插件**: 在node节点上安装head,Cerebro 等插件,实现图形操作,查看数据方便
+-   **Kibana**: 需要java环境并配置,图形操作,显示格式丰富
+
+### 查看ES集群状态
+
+```shell
+# 查看支持的指令
+curl http://127.0.0.1:9200/_cat
+
+#查看es集群状态，?v是详细显示 ?human是可阅读显示
+curl http://127.0.0.1:9200/_cat/health
+
+#查看集群健康性
+curl http://127.0.0.1:9200/_cluster/health?pretty=true
+
+#查看所有的节点信息
+curl 'http://127.0.0.1:9200/_cat/nodes?v'
+
+#列出所有的索引 以及每个索引的相关信息
+curl 'http://127.0.0.1:9200/_cat/indices?v'
+```
+
+### 创建，查看，删除索引
+
+```shell
+#创建索引index1
+curl -XPUT '127.0.0.1:9200/index1'
+# 默认会自动生成一个副本
+
+# 副本丢失会，再次创建副本
+# 颜色含义：
+# 绿色：完全健康
+# 黄色：副本丢了，数据没丢
+# 红色：数据丢失
+
+# 因为少于半数以上可用，即3个节点的集群，关了两个，因此集群不可用，es无法访问
+
+#创建索引index2,格式化输出
+curl -XPUT '127.0.0.1:9200/index2?pretty'
+#查看所有索引
+curl 'http://127.0.0.1:9200/_cat/indices?v'
+# 查看索引格式化输出
+curl 'http://127.0.0.1:9200/index1?pretty'
+```
+
+![image-20250314093328649](pic/image-20250314093328649.png)
+
+![image-20250314094633256](pic/image-20250314094633256.png)
+
+```shell
+# 创建3个分片和2个副本的索引
+curl -XPUT '127.0.0.1:9200/index3' -H 'Content-Type: application/json' -d '
+{                     
+  "settings": {
+    "index": {
+      "number_of_shards": 3,  
+      "number_of_replicas": 2
+   }                         
+ }
+}'
+
+# 创建3分片，1副本（生产中建议分片数和节点数相同，实现负载均衡）
+curl -XPUT '127.0.0.1:9200/index4' -H 'Content-Type: application/json' -d '
+{                     
+  "settings": {
+    "index": {
+      "number_of_shards": 3,  
+      "number_of_replicas": 1
+   }                         
+ }
+}'
+# ES自动将分片数据均匀的放在不同节点上，实现高可用
+```
+
+![image-20250314093940483](pic/image-20250314093940483.png)
+
+```shell
+curl -XDELETE http://127.0.0.1:9200/index2
+
+# 删除所有索引
+vim /etc/elasticsearch/elasticsearch.yml
+action.destructive_requires_name: false
+
+curl -X DELETE "http://127.0.0.1:9200/*"
+
+# 也可以不开启action.destructive_requires_name，使用循环进行批量删除
+for i in `curl 'http://127.0.0.1:9200/_cat/indices?v'|awk '{print $3}'`;do curl -XDELETE http://127.0.0.1:9200/$i;done
+```
+
+### doc 文档操作
+
+```shell
+#创建文档时不指定_id，会自动生成
+#8.X版本后因为删除了type,所以索引操作：{index}/{type}/需要修改成{index}/_doc/
+#8.X版本之后
+
+curl -XPOST http://127.0.0.1:9200/index0/_doc/ -H 'Content-Type: application/json' -d '{"name":"linux", "author": "ll", "version": "1.0"}'
+
+# 指定id，插入文档（通常是系统分配）
+curl -XPOST 'http://127.0.0.1:9200/index0/_doc/3?pretty' -H 'Content-Type: application/json' -d '{"name":"golang", "author": "ll", "version": "1.0"}' 
+```
+
+查询文档
+
+```shell
+# 所有文档
+curl 'http://127.0.0.1:9200/index0/_search?pretty'
+
+# 指定ID
+curl 'http://127.0.0.1:9200/index0/_doc/3?pretty'
+```
+
+更新文档
+
+```shell
+curl -XPOST 'http://127.0.0.1:9200/index0/_doc/3' -H 'Content-Type: application/json' -d '{"version": "2.0","name":"golang","author": "ll"}'
+```
+
+删除文档
+
+```shell
+curl -XDELETE 'http://127.0.0.1:9200/index1/_doc/3'
+```
+
+# ELasticsearch集群工作原理
+
+单机节点 ES 存在单点可用性和性能问题,可以实现Elasticsearch多机的集群解决
+
+Elasticsearch 支持集群模式
+
+-   能够提高Elasticsearch可用性，即使部分节点停止服务，整个集群依然可以正常服务
+-   能够增大Elasticsearch的性能和容量，如内存、磁盘，使得Elasticsearch集群可以支持PB级的数据
+
+## ES 节点分类
+
+*   **Master节点**
+    *   ES集群中只有一个 Master 节点，用于**控制**和**管理**整个集群的操作
+    *   Master 节点负责**增删索引**,**增删节点**,**分片shard的重新分配**
+    *   Master 主要维护**Cluster State**，包括节点名称,节点连接地址,索引名称和配置信息等
+    *   Master 接受集群状态的变化并推送给所有其它节点,集群中各节点都有一份完整的集群状态信息， 都由master node负责维护
+    *   Master 节点**不需要**涉及到**文档级别**的变更和搜索等操作
+    *   协调创建索引请求或查询请求，将请求分发到相关的node上。
+    *   当Cluster State有新数据产生后， Master 会将数据同步给其他 Node 节点
+    *   Master节点通过超过一半的节点投票选举产生的
+    *   可以设置node.master: true 指定为是否参与Master节点选举, 默认true
+*   **Data节点**
+    *   存储数据的节点即为 data 节点
+    *   当创建索引后，索引的数据会存储至某个数据节点
+    *   Data 节点消耗内存和磁盘IO的性能比较大
+    *   配置node.data: true, 就是Data节点，默认为 true,**即默认所有节点都是 Data 节点类型**
+*   **Coordinating 节点(协调)**
+    *   处理请求的节点即为 coordinating 节点，该节点类型为所有节点的默认角色，不能取消coordinating 节点。主要将请求路由到正确的节点处理。比如创建索引的请求会由 coordinating 路由到 master 节点处理
+    *   当配置 node.master:false、node.data:false 则只充当 Coordinating 节点
+    *   Coordinating 节点在 Cerebro 等插件中数据页面不会显示出来
+*   **Master-eligible 初始化时有资格选举Master的节点**
+    *   集群初始化时有权利参于选举Master角色的节点
+    *   只在集群第一次初始化时进行设置有效，后续配置无效
+    *   由 cluster.initial_master_nodes 配置节点地址
+
+## ES集群选举
+
+选举时,优先选举**ClusterStateVersion**最大的Node节点，如果ClusterStateVersion相同，则选举**Node ID**最小的Node
+
+ClusterStateVersion 是集群状态的版本号，每当集群状态发生变更时（例如节点加入、索引创建、分片重新分配等），版本号都会递增。因此，这个版本号越大，说明是越早加入集群的，里面的数据越多
+
+**Node的ID**是在第一次服务启动时随机生成的，直接选用最小ID的Node，主要是为了选举的稳定性，尽量少出现选举不出来的问题。
+
+```shell
+curl -XGET "http://10.0.0.222:9200/_cluster/state/version?pretty"
+{
+  "cluster_name" : "my-application",
+  "cluster_uuid" : "o5dy5KnXTLqYi5nxANWaZw",
+  "version" : 222, # ClusterStateVersion
+  "state_uuid" : "_U7QTJ_PSwezxZyl2NWMdg"
+}
+
+curl -XGET "http://10.0.0.222:9200/_cat/nodes?v&h=ip,name,id"
+ip         name   id
+10.0.0.223 node-2 vaWX
+10.0.0.224 node-3 8r4D
+10.0.0.222 node-1 wkhV
+```
+
+
+
+## ES 集群 Shard 和 Replication
+
+### 分片 Shard
+
+ES 中存储的数据可能会很大,有时会达到PB级别，单节点的容量和性能可以无法满足
+
+基于容量和性能等原因,可以将一个索引数据分割成多个小的分片
+
+再将每个分片分布至不同的节点,从而实现数据的分布存储,实现性能和容量的水平扩展
+
+在读取时,可以实现多节点的并行读取,提升性能
+
+除此之外,如果一个分片的主机宕机,也不影响其它节点分片的读取
+
+横向扩展即增加服务器，当有新的Node节点加入到集群中时，集群会动态的重新进行均匀分配和负载
+
+例如原来有两个Node节点，每个节点上有3个分片，即共6个分片,如果再添加一个node节点到集群中，
+集群会动态的将此6个分片分配到这三个节点上，最终每个节点上有2个分片。
+
+### 副本 Replication
+
+将一个索引分成多个数据分片,仍然存在数据的单点问题,可以对每一个分片进行复制生成副本,即备份,实现数据的高可用
+
+ES的分片分为主分片（primary shard）和副本分片（复制replica shard），而且通常分布在不同节点
+
+**主分片实现数据读写,副本分片只支持读**
+
+在索引中的每个分片只有一个主分片,而对应的副本分片可以有多个,一个副本本质上就是一个主分片的备份
+
+每个分片的主分片在创建索引时自动指定且后续不能人为更改
+
+**默认分片配置**
+
+默认情况下，elasticsearch将分片相关的配置从配置文件中的属性移除了，可以借助于一个默认的模板接口将索引的分片属性更改成我们想要的分片效果
+
+```shell
+curl -XPUT 'http://127.0.0.1:9200/_template/template_http_request_record' -H 'Content-Type: application/json' -d '{"index_patterns": ["*"],"settings": {"number_of_shards": 5,"number_of_replicas": 1}}'
+
+#属性解析：
+接口地址：_template/template_http_request_record
+索引类型：index_patterns
+分片数量：number_of_shards
+副本数量：number_of_replicas
+```
+
+## 数据同步机制
+
+Elasticsearch主要依赖 **Zen Discovery 协议**来管理集群中节点的加入和离开，以及选举主节点（master node）。
+
+Zen Discovery是Elasticsearch自带的一个协议，不依赖于任何外部服务。
+
+然而，Elasticsearch对于一致性的处理与传统的一致性协议（如Raft或Paxos）有所不同。它采取了一 种“**最终一致性**”（eventual consistency）的模型。
+
+每个索引在Elasticsearch中被分成多个分片（shard），每个分片都有一个主分片和零个或多个副本分片。
+
+主分片负责处理所有的写操作，并将写操作复制到其副本分片。当主分片失败时，一个副本分片会被提升为新的主分片
+
+Elasticsearch为了提高写操作的性能，允许在主分片写入数据后立即确认写操作，而不需要等待数据被所有副本分片确认写入。这就意味着，在某些情况下，主分片可能会确认写操作成功，而实际上副本分片还没有完全写入数据。这就可能导致数据在短时间内在主分片和副本分片之间不一致。然而，一旦所 有副本分片都确认写入了数据，那么系统就会达到“最终一致性”。
+
+为了保证搜索的准确性，Elasticsearch还引入了一个**"refresh"机制**，每隔一定时间（默认为1秒）将最新的数据加载到内存中，使其可以被搜索到。这个过程是在主分片和所有副本分片上独立进行的，所以可能存在在短时间内搜索结果在不同分片之间有些许不一致的情况，但随着时间的推移，所有分片上的数据都会达到一致状态。
+
+## 集群故障转移
+
+故障转移指的是，当集群中有节点发生故障时，ES集群会进行自动修复
+
+![image-20250314152301829](pic/image-20250314152301829.png)
+
+**ES集群的故障转移流程如下**
+
+-   重新选举
+    -   假设当前Master节点 node3 节点宕机,同时也导致 node3 的原有的P1和R2分片丢失
+    -   node1 和 node2 发现 Master节点 node3 无法响应
+    -   过一段时间后会重新发起 master 选举
+    -   比如这次选择 node2 为 新 master 节点；此时集群状态变为yellow 状态
+    -   其实无论选举出的新Master节点是哪个节点，都不影响后续的分片的重新分布结果
+
+![image-20250121175830942](pic/image-20250121175830942.png)
+
+-   主分片调整
+    -   新的Master节点 node2 发现在原来在node3上的主分片 P1 丢失
+    -   将 node1 上的 R1 提升为主分片
+    -   此时所有的主分片都正常分配，但1和2分片没有副本分片
+    -   集群状态变为 Yellow状态
+-   副本分片调整
+    -   node1 将 P1 和 node2上的P2 主分片重新生成新的副本分片 R1、R2，此时集群状态变为 Green
+
+-   后续修复好node3节点后，Master 不会重新选举，但会自动将各个分片重新均匀分配
+    -   保证主分片尽可能分布在每个节点上
+    -   副本分片也尽可能分布不同的节点上
+    -   重新分配的过程需要一段时间才能完成
+
+![image-20250121180438208](pic/image-20250121180438208.png)
+
+## ES文档路由
+
+ES文档是分布式存储，当在ES集群访问或存储一个文档时，由下面的算法决定此**文档到底存放在哪个主分片中**,再结合**集群状态**找到存放此主分片的节点主机
+
+```shell
+shard = hash(routing) % number_of_primary_shards
+hash                     #哈希算法可以保证将数据均匀分散在分片中
+routing                  #用于指定用于hash计算的一个可变参数，默认是文档id，也可以自定义
+number_of_primary_shards #主分片数
+# 注意：该算法与主分片数相关，一旦确定后便不能更改主分片，因为主分片数的变化会导致所有分片需要重新分配
+# 先根据哈希/主分片数计算出要存放到几号分片中，存放到主分片后，再将数据复制到副本分片中
+```
+
+**ES 文档创建删除流程**
+
+![image-20250121181541492](pic/image-20250121181541492.png)
+
+-   客户端向集群中某个节点 Node1 发送**新建索引文档**或者**删除索引文档**请求
+-   Node1节点使用文档的 _id 通过上面的算法确定文档属于分片 0
+-   因为分片 0 的主分片目前被分配在 Node3 上,请求会被转发到 Node3
+-   Node3 在主分片上面执行创建或删除请求
+-   Node3 执行如果成功，它将请求并行转发到 Node1 和 Node2 的副本分片上
+-   Node3 将向协调节点Node1 报告成功
+-   协调节点Node1 客户端报告成功。
+
+**ES 文档读取流程**
+
+![image-20250121181827402](pic/image-20250121181827402.png)
+
+-   客户端向集群中某个节点 Node1 发送读取请求
+-   节点使用文档的 _id 来确定文档属于分片 0 。分片 0 的主副本分片存在于所有的三个节点上
+-   在处理读取请求时，协调节点在每次请求的时候都会通过轮询所有的主副本分片来达到负载均衡， 此次它将请求转发到 Node2
+-   Node2 将文档返回给 Node1 ，然后将文档返回给客户端
+
+# Kibana图形显示
+
+Kibana 是一款开源的数据分析和可视化平台，它是 Elastic Stack 成员之一，设计用于和 Elasticsearch 协作,可以使用 Kibana 对 Elasticsearch 索引中的数据进行搜索、查看、交互操作,您可以很方便的利用 图表、表格及地图对数据进行多元化的分析和呈现。
+
+Kibana 可以使大数据通俗易懂。基于浏览器的界面便于您快速创建和分享动态数据仪表板来追踪 Elasticsearch 的实时数据变化。
+
+## 安装并配置 Kibana
+
+可以通过包或者二进制的方式进行安装,可以安装在独立服务器,或者也可以和elasticsearch的主机安装在 一起
+
+[elastic/kibana: Your window into the Elastic Stack](https://github.com/elastic/kibana)
+
+### 包安装
+
+基于性能原因，建议将Kibana安装到独立节点上，而非和ES节点复用
+
+```shell
+wget https://artifacts.elastic.co/downloads/kibana/kibana-8.17.3-amd64.deb
+sudo dpkg -i kibana-8.17.3-amd64.deb
+useradd -r -s /sbin/nologin kibana
+```
+
+配置
+
+```shell
+vim /etc/kibana/kibana.yml
+server.port: 5601  #监听端口,此为默认值
+server.host: "0.0.0.0" #修改此行的监听地址,默认为localhost，即：127.0.0.1:5601
+
+#修改此行,指向ES任意服务器地址或多个节点地址实现容错,默认为localhost
+elasticsearch.hosts: ["http://10.0.0.222:9200","http://10.0.0.223:9200","http://10.0.0.224:9200"] 
+
+i18n.locale: "zh-CN"   #修改此行,使用"zh-CN"显示中文界面,默认英文
+
+#8.X版本新添加配置,默认被注释,会显示下面提示
+server.publicBaseUrl: "http://kibana.loong.com"
+
+systemctl start kibana.service
+```
+
+磁盘空间不足，elastic不会接收新的分片。
+
+**检查磁盘水位**
+
+查看 `node-2` 和 `node-3` 的磁盘使用情况：
+
+```shell
+curl -X GET "http://localhost:9200/_cat/allocation?v"
+```
+
+如果 `node` 的 `disk.percent` 接近 85%，Elasticsearch 可能不会分配副本给 `node-2`。
+
+ **解决方法**： 增加磁盘水位阈值：
+
+```shell
+curl -X PUT "http://localhost:9200/_cluster/settings" -H "Content-Type: application/json" -d'
+{
+  "persistent": {
+    "cluster.routing.allocation.disk.watermark.low": "95%",
+    "cluster.routing.allocation.disk.watermark.high": "97%",
+    "cluster.routing.allocation.disk.watermark.flood_stage": "98%",
+    "cluster.info.update.interval": "1m"
+  }
+}'
+```
+
+然后再尝试分片分配：
+
+```shell
+curl -XPOST "http://localhost:9200/_cluster/reroute?pretty"
+```
+
+# Beats收集数据
+
