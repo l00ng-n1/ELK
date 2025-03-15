@@ -609,7 +609,9 @@ Elasticsearch 支持集群模式
 -   能够提高Elasticsearch可用性，即使部分节点停止服务，整个集群依然可以正常服务
 -   能够增大Elasticsearch的性能和容量，如内存、磁盘，使得Elasticsearch集群可以支持PB级的数据
 
-## ES 节点分类
+## 节点
+
+### ES 节点分类
 
 *   **Master节点**
     *   ES集群中只有一个 Master 节点，用于**控制**和**管理**整个集群的操作
@@ -626,14 +628,58 @@ Elasticsearch 支持集群模式
     *   当创建索引后，索引的数据会存储至某个数据节点
     *   Data 节点消耗内存和磁盘IO的性能比较大
     *   配置node.data: true, 就是Data节点，默认为 true,**即默认所有节点都是 Data 节点类型**
+*   **Ingest 节点**
+    *   如果集群中有大量数据预处理需求（如日志解析、字段提取等），可以引入专门的 Ingest 节点。 功能类似logstash
+    *   将 Ingest 节点与 Data 节点分离，避免数据预处理影响数据存储和查询性能
+    *   负责数据预处理（如管道处理、数据转换等）
+    *   Ingest 节点的基础原理是：节点接收到数据之后，根据请求参数中指定的管道流 id，找到对应的已 注册管道流，对数据进行处理，然后将处理过后的数据，按照 Elasticsearch 标准的 indexing 流程 继续运行。
+
 *   **Coordinating 节点(协调)**
     *   处理请求的节点即为 coordinating 节点，该节点类型为所有节点的默认角色，不能取消coordinating 节点。主要将请求路由到正确的节点处理。比如创建索引的请求会由 coordinating 路由到 master 节点处理
+    *   这可以减轻 Data 节点的负载，提高查询性能。
     *   当配置 node.master:false、node.data:false 则只充当 Coordinating 节点
     *   Coordinating 节点在 Cerebro 等插件中数据页面不会显示出来
+*   **Machine Learning 节点**
+    *   负责机器学习任务（如异常检测等）。
+    *   如果使用 Elasticsearch 的机器学习功能，可以配置专门的 Machine Learning 节点。
+    *   这些节点需要较高的 CPU 和内存资源。
+    *   需要 enable x-pack
+
 *   **Master-eligible 初始化时有资格选举Master的节点**
     *   集群初始化时有权利参于选举Master角色的节点
     *   只在集群第一次初始化时进行设置有效，后续配置无效
     *   由 cluster.initial_master_nodes 配置节点地址
+
+### 节点规划
+
+单一职责的节点: 一个节点只承担一个角色
+
+![image-20250315194644465](pic/image-20250315194644465.png)
+
+*   Dedicated master nodes：负责集群状态（cluster state）的管理
+    *   从高可用 & 避免脑裂的角色出发,一般在生产环境中配置 3 台,一个集群只有 1 台活跃的主节点 使用低配置的 CPU ,RAM 和磁盘
+*   Dedicated data nodes: 负责数据存储及处理客户端请求
+    *   使用高配置的 CPU,RAM 和磁盘
+*   Dedicated ingest nodes: 负责数据处理
+    *   使用高配置的 CPU ; 中等配置的 RAM; 低配置的磁盘
+*   Dedicate Coordinating Only Node (Client Node)
+    *   配置：将 Master ，Data ，Ingest 都配置成 Flase
+    *   生产环境中，建议为一些大的集群配置 Coordinating Only Nodes,扮演 Load Balancers。 降低  Master 和 Data Nodes 的负载
+    *   负载搜索结果的 Gather / Reduce有时候无法预知客户端会发生怎样的请求大量占用内存的结合操 作，一个深度聚合可能引发 OOM
+
+### 节点架构
+
+当磁盘容量无法满足需求时，可以增加数据节点；磁盘读写压力大时，增加数据节点
+
+![image-20250315195002428](pic/image-20250315195002428.png)
+
+当系统中有大量的复杂查询及聚合时候，增加 Coordinating 节点，增加查询的性能
+
+![image-20250315195014846](pic/image-20250315195014846.png)
+
+读写分离
+
+![image-20250315195024200](pic/image-20250315195024200.png)
 
 ## ES集群选举
 
@@ -788,6 +834,52 @@ number_of_primary_shards #主分片数
 -   在处理读取请求时，协调节点在每次请求的时候都会通过轮询所有的主副本分片来达到负载均衡， 此次它将请求转发到 Node2
 -   Node2 将文档返回给 Node1 ，然后将文档返回给客户端
 
+# Beats收集数据
+
+Beats 是一个免费且开放的平台，集合了多种单一用途数据采集器。它们从成百上千或成千上万台机器 和系统向 Logstash 或 Elasticsearch 发送数据。 
+
+虽然利用 logstash 就可以收集日志，功能强大，但由于 Logstash 是基于Java实现，需要在采集日志的 主机上安装JAVA环境
+
+ogstash运行时最少也会需要额外的**500M的以上的内存**，会消耗比较多的内存和磁盘空间， 可以采有基于Go开发的 Beat 工具代替 Logstash 收集日志，部署更为方便，而且只占用**10M左右的内 存空间**及更小的磁盘空间。
+
+[Beats: Data Shippers for Elasticsearch | Elastic](https://www.elastic.co/beats)
+
+[elastic/beats: :tropical_fish: Beats - Lightweight shippers for Elasticsearch & Logstash](https://github.com/elastic/beats)
+
+ Beats 是一些工具集,包括以下,其中 filebeat 应用最为广泛
+
+![image-20250315203325197](pic/image-20250315203325197.png)
+
+```shell
+filebeat:收集日志文件数据。最常用的工具
+packetbeat:用于收集网络数据。一般用zabbix实现此功能
+metricbeat:从OS和服务收集指标数据，比如系统运行状态、CPU 内存利用率等。
+winlogbeat: 从Windows平台日志收集工具。
+heartbeat: 定时探测服务是否可用。支持ICMP、TCP 和 HTTP，也支持TLS、身份验证和代理
+auditbeat:收集审计日志
+Functionbeat:使用无服务器基础架构提供云数据。面向云端数据的无服务器采集器，处理云数据
+```
+
+| Beat                                                         | Description                                                  |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
+| [Auditbeat](https://github.com/elastic/beats/tree/main/auditbeat) | Collect your Linux audit framework data and monitor the integrity of your files. |
+| [Filebeat](https://github.com/elastic/beats/tree/main/filebeat) | Tails and ships log files                                    |
+| [Heartbeat](https://github.com/elastic/beats/tree/main/heartbeat) | Ping remote services for availability                        |
+| [Metricbeat](https://github.com/elastic/beats/tree/main/metricbeat) | Fetches sets of metrics from the operating system and services |
+| [Packetbeat](https://github.com/elastic/beats/tree/main/packetbeat) | Monitors the network and applications by sniffing packets    |
+| [Winlogbeat](https://github.com/elastic/beats/tree/main/winlogbeat) | Fetches and ships Windows Event logs                         |
+| [Osquerybeat](https://github.com/elastic/beats/tree/main/x-pack/osquerybeat) | Runs Osquery and manages interraction with it.               |
+
+**Beats 版本要和 Elasticsearch 相同的版本，否则可能会出错**
+
+## 利用 Metricbeat 监控性能相关指标
+
+Metricbeat 可以收集指标数据，比如系统运行状态、CPU、内存利用率等。 
+
+生产中一般用 zabbix 等专门的监控系统实现此功能
+
+
+
 # Kibana图形显示
 
 Kibana 是一款开源的数据分析和可视化平台，它是 Elastic Stack 成员之一，设计用于和 Elasticsearch 协作,可以使用 Kibana 对 Elasticsearch 索引中的数据进行搜索、查看、交互操作,您可以很方便的利用 图表、表格及地图对数据进行多元化的分析和呈现。
@@ -860,5 +952,72 @@ curl -X PUT "http://localhost:9200/_cluster/settings" -H "Content-Type: applicat
 curl -XPOST "http://localhost:9200/_cluster/reroute?pretty"
 ```
 
-# Beats收集数据
+## 使用 Kibana
+
+### 连接ES
+
+#### Kibana 8.X 开启xpack.security功能连接ES
+
+```shell
+#在ES节点上生成token
+/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token --scope kibana
+123456
+
+#查看 verification code
+systemctl status kibana.service
+Your verification code is:  201 867
+```
+
+浏览器访问,填写上面的token
+
+![image-20250315195437267](pic/image-20250315195437267.png)
+
+填写code
+
+![image-20250315195442505](pic/image-20250315195442505.png)
+
+#### Kibana 8.X 禁用xpack.security功能连接ES
+
+![image-20250315195650413](pic/image-20250315195650413.png)
+
+![image-20250315195735457](pic/image-20250315195735457.png)
+
+![image-20250315195750136](pic/image-20250315195750136.png)
+
+![image-20250315195830052](pic/image-20250315195830052.png)
+
+### 管理索引
+
+![image-20250315200133491](pic/image-20250315200133491.png)
+
+```shell
+GET _search
+
+GET _search 
+{ 
+    "query":{
+        "match_all":{}
+    }
+}
+```
+
+![image-20250315200334073](pic/image-20250315200334073.png)
+
+创建索引并创建doc
+
+```shell
+POST /index_wang/_doc/1
+{
+    "username": "wang",
+    "age": 18,
+    "title": "cto"
+}
+
+# 查看
+GET /index_wang/_doc/1
+```
+
+![image-20250315200707082](pic/image-20250315200707082.png)
+
+
 
