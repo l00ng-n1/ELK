@@ -422,7 +422,7 @@ LimitMEMLOCK=infinity
 #思考：假设总数据量为2TB，3个node节点，1个副本呢？
 ```
 
-### **修改service文件，做优化配置**
+### 修改service文件，做优化配置
 
 ```shell
 [root@es-node1 ~]# vim /usr/lib/systemd/system/elasticsearch.service 
@@ -527,7 +527,7 @@ curl 'http://127.0.0.1:9200/index1?pretty'
 
 ```shell
 # 创建3个分片和2个副本的索引
-curl -XPUT '127.0.0.1:9200/index3' -H 'Content-Type: application/json' -d '
+curl -XPUT '127.0.0.1:9200/test' -H 'Content-Type: application/json' -d '
 {                     
   "settings": {
     "index": {
@@ -834,6 +834,20 @@ number_of_primary_shards #主分片数
 -   在处理读取请求时，协调节点在每次请求的时候都会通过轮询所有的主副本分片来达到负载均衡， 此次它将请求转发到 Node2
 -   Node2 将文档返回给 Node1 ，然后将文档返回给客户端
 
+## 生产故障
+
+故障说明:负载不高，但是有的索引会查询不出来,查看到下面的日志信息
+
+![image-20250316105812009](pic/image-20250316105812009.png)在Elasticsearch中，search.max_open_scroll_context 参数用于限制集群中可以同时打 开的 scroll 上下文的数量。这个参数的默认值在不同版本的 Elasticsearch 中可能会有所不同，但根 据搜索结果显示，在某些版本的 Elasticsearch 中，默认值可能是 500  或 2000 。这个默认值是为了 防止过多的 scroll 上下文同时打开导致资源耗尽。如果需要处理大量的数据，可能需要根据实际情况调整 这个参数的值
+
+```shell
+curl -X PUT localhost:9200/_cluster/settings -H 'Content-Type: application/json' -d'{"persistent" : {"search.max_open_scroll_context": 8000}, "transient": {"search.max_open_scroll_context": 8000}}'
+
+curl -X GET localhost:9200/_cluster/settings
+```
+
+
+
 # Beats收集数据
 
 Beats 是一个免费且开放的平台，集合了多种单一用途数据采集器。它们从成百上千或成千上万台机器 和系统向 Logstash 或 Elasticsearch 发送数据。 
@@ -878,7 +892,340 @@ Metricbeat 可以收集指标数据，比如系统运行状态、CPU、内存利
 
 生产中一般用 zabbix 等专门的监控系统实现此功能
 
+[Metricbeat quick start: installation and configuration | Metricbeat Reference [8.17\] | Elastic](https://www.elastic.co/guide/en/beats/metricbeat/current/metricbeat-installation-configuration.html)
 
+```shell
+curl -L -O https://artifacts.elastic.co/downloads/beats/metricbeat/metricbeat-8.17.3-amd64.deb
+sudo dpkg -i metricbeat-8.17.3-amd64.deb
+```
+
+配置
+
+```shell
+vim /etc/metricbeat/metricbeat.yml
+setup.kibana:
+  host: "10.0.0.220:5601" 
+output.elasticsearch:
+  # Array of hosts to connect to.
+  hosts: ["10.0.0.222:9200","10.0.0.223:9200","10.0.0.224:9200"]
+
+systemctl start metricbeat.service
+```
+
+![image-20250316111413808](pic/image-20250316111413808.png)
+
+通过 Kibana 查看收集的性能指标
+
+Observability --- 基础设施- 基础设施库存
+
+## 利用 Heartbeat 监控
+
+[Heartbeat quick start: installation and configuration | Heartbeat Reference [8.17\] | Elastic](https://www.elastic.co/guide/en/beats/heartbeat/current/heartbeat-installation-configuration.html)
+
+```shell
+wget https://artifacts.elastic.co/downloads/beats/heartbeat/heartbeat-8.17.3-amd64.deb
+sudo dpkg -i heartbeat-8.17.3-amd64.deb
+```
+
+官方配置[Configure Heartbeat monitors | Heartbeat Reference [8.17\] | Elastic](https://www.elastic.co/guide/en/beats/heartbeat/current/configuration-heartbeat-options.html)
+
+```shell
+# heartbeat.yml
+heartbeat.monitors:
+- type: icmp
+  id: ping-myhost
+  name: My Host Ping
+  hosts: ["myhost"]
+  schedule: '*/5 * * * * * *'
+- type: tcp
+  id: myhost-tcp-echo
+  name: My Host TCP Echo
+  hosts: ["myhost:777"]  # default TCP Echo Protocol
+  check.send: "Check"
+  check.receive: "Check"
+  schedule: '@every 5s'
+- type: http
+  id: service-status
+  name: Service Status
+  service.name: my-apm-service-name
+  hosts: ["http://localhost:80/service/status"]
+  check.response.status: [200]
+  schedule: '@every 5s'
+heartbeat.scheduler:
+  limit: 10
+```
+
+```shell
+Field name     Mandatory?   Allowed values    Allowed special characters
+----------     ----------   --------------    --------------------------
+Seconds        No           0-59              * / , -
+Minutes        Yes          0-59              * / , -
+Hours          Yes          0-23              * / , -
+Day of month   Yes          1-31              * / , - L W
+Month          Yes          1-12 or JAN-DEC   * / , -
+Day of week    Yes          0-6 or SUN-SAT    * / , - L #
+Year           No           1970–2099         * / , -
+```
+
+配置
+
+```shell
+vim /etc/heartbeat/heartbeat.yml
+setup.kibana:
+  host: "10.0.0.220:5601"
+output.elasticsearch:
+  # Array of hosts to connect to.
+  hosts: ["10.0.0.222:9200","10.0.0.223:9200","10.0.0.224:9200"]
+  
+# 监控项
+heartbeat.monitors:
+- type: http
+  enabled: true # 启动
+  id: my-monitor
+  name: My Monitor
+  urls: ["http://localhost:9000"]
+  schedule: '@every 10s'
+  # Total test connection and data exchange timeout
+  #timeout: 16s
+  # Name of corresponding APM service, if Elastic APM is in use for the monitored service.
+  #service.name: my-apm-service-name   
+  
+setup.template.settings:
+  index.number_of_shards: 3         # 修改分片数量，因为集群有3个节点，因此改为3
+  index.codec: best_compression
+```
+
+Observability---运行时间--监测 Uptime Monitors
+
+![image-20250316115627597](pic/image-20250316115627597.png)
+
+利用 Kibana 将 Heartbeat 的数据进行可视化
+
+## 利用 Filebeat 收集日志
+
+Filebeat 是用于转发和集中日志数据的轻量级传送程序。作为服务器上的代理安装，Filebeat监视您指定 的日志文件或位置，收集日志事件，并将它们转发到Elasticsearch或Logstash进行索引。
+
+filebeat 支持从日志文件,Syslog,Redis,Docker,TCP,UDP,标准输入等读取数据,对数据做简单处理，再输 出至Elasticsearch,logstash,Redis,Kafka等
+
+Filebeat的工作方式如下： 
+
+*   启动Filebeat时，它将启动一个或多个输入源，这些输入将在为日志数据指定的位置中查找。
+*    对于Filebeat所找到的每个日志，Filebeat都会启动收集器harvester进程。 
+*   每个收集器harvester都读取一个日志以获取新内容，并将新日志数据发送到libbeat 
+*   libbeat会汇总事件并将汇总的数据发送到为Filebeat配置的输出。
+
+![image-20250316180223271](pic/image-20250316180223271.png)
+
+注意: Filebeat 支持多个输入,但不支持同时有多个输出，如果多输出，会报错如下
+
+```shell
+Exiting: error unpacking config data: more than one namespace configured 
+accessing 'output' (source:'/etc/filebeat/stdout_file.yml')
+```
+
+### 安装
+
+```shell
+wget https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-8.17.3-amd64.deb
+sudo dpkg -i filebeat-8.17.3-amd64.deb
+```
+
+### Filebeat 配置
+
+```shell
+vim /etc/filebeat/filebeat.yml
+setup.kibana:
+  host: "10.0.0.220:5601"
+output.elasticsearch:
+  # Array of hosts to connect to.
+  hosts: ["10.0.0.222:9200","10.0.0.223:9200","10.0.0.224:9200"]
+
+#语法检查
+filebeat test config  -c  /etc/filebeat/filebeat.yml
+```
+
+### 从STDIN读取再输出STDOUT
+
+```shell
+vim ~/stdin.yaml
+filebeat.inputs:
+- type: stdin
+  enabled: true
+  tags: ["stdin-tags","myapp"]  #添加新字段名tags，可以用于判断不同类型的输入，实现不同的输出，日志做分类
+  fields:
+    status_code: "200"      #添加新字段名fields.status_code，可以用于判断不同类型的输入，实现不同的输出，日志做分类
+    author: "ll"
+
+output.console:
+  pretty: true
+  enable: true
+  
+filebeat test config -c /root/stdin.yaml 
+
+#从指定文件中读取配置
+#-e 表示Log to stderr and disable syslog/file output
+# 解析文本，不能解析json格式文本
+filebeat -e -c /root/stdin.yaml
+# 在屏幕输入hello
+
+
+# 解析Json格式文本
+filebeat.inputs:
+- type: stdin
+  enable: true
+  json.keys_under_root: true  # 解析json
+
+output.console:
+  pretty: true
+  enable: true
+  
+# 输入{"name" : "mystical", "age" : "18", "phone" : "0123456789"}
+```
+
+### 从STDIN读取再输出FILE
+
+```shell
+vim ~/stdin2file.yaml
+filebeat.inputs:
+- type: stdin
+  enable: true
+  json.keys_under_root: true
+
+output.file:
+  path: "/tmp"
+  filename: "filebeat.log"
+  
+filebeat -c /root/stdin2file.yaml
+{"name" : "ll", "age" : "18", "phone" : "0123456789"}
+
+cat /tmp/filebeat.log-20250316.ndjson | jq
+{
+  "@timestamp": "2025-03-16T11:41:06.299Z",
+  "@metadata": {
+    "beat": "filebeat",
+    "type": "_doc",
+    "version": "8.17.3"
+  },
+  "log": {
+    "offset": 0,
+    "file": {
+      "path": ""
+    }
+  },
+  "name": "mystical",
+  "input": {
+    "type": "stdin"
+  },
+  "agent": {
+    "id": "f2138a29-4b67-4053-bbf5-267bcc60cad4",
+    "name": "ubuntu-2204",
+    "type": "filebeat",
+    "version": "8.17.3",
+    "ephemeral_id": "e3e6ca1f-ef15-446e-95c4-527eeaca8845"
+  },
+  "ecs": {
+    "version": "8.0.0"
+  },
+  "host": {
+    "name": "ubuntu-2204"
+  },
+  "age": "18",
+  "phone": "0123456789"
+}
+```
+
+### 从FILE读取再输出至STDOUT
+
+filebeat 会将每个文件的读取数据的相关信息记录在`/var/lib/filebeat/registry/filebeat/log.json`文件中,可以实现日志采集的持续性,而不会重复采集
+
+-   当日志文件大小发生变化时，filebeat会接着上一次记录的位置继续向下读取新的内容
+-   当日志文件大小没有变化，但是内容发生变化，filebeat会将文件的全部内容重新读取一遍
+
+```yaml
+vim /root/file2stdout.yaml 
+filebeat.inputs:
+- type: log
+  enable: true
+  json.keys_under_root: true
+  paths:
+  #- /var/log/syslog
+  - /var/log/test.log
+
+output.console:
+  pretty: true
+  enable: true
+
+filebeat -c /root/file2stdout.yaml 
+
+echo '{"name" : "ll", "age" : "20", "phone" : "0123456789"}' >> /var/log/test.log
+```
+
+不同的文件不同的tag与fields
+
+```shell
+filebeat.inputs:
+- type: log
+  paths:
+  - /var/log/app1
+  json.keys_under_root: true
+  tags: ["app1_tag"]
+  fields:
+    type: "app1"
+
+- type: log
+  paths:
+  - /var/log/app2
+  json.keys_under_root: true
+  tags: ["app2_tag"]
+  field:
+    type: "app2"
+    
+output.console:
+  pretty: true
+  
+filebeat -c /root/file2stdout.yaml 
+
+echo '{"name" : "llk", "age" : "20", "phone" : "0123456789"}' >> /var/log/app1
+echo '{"name" : "ll", "age" : "20", "phone" : "0123456789"}' >> /var/log/app2
+```
+
+### 利用 Filebeat 收集系统日志到 ELasticsearch
+
+```shell
+vim /etc/filebeat/filebeat.yml
+filebeat.inputs:
+- type: log
+  json.keys_under_root: true
+  enabled: true                   # 开启日志
+  paths:
+  - /var/log/syslog                    # 指定收集的日志
+
+output.elasticsearch:
+  hosts: ["10.0.0.222:9200", "10.0.0.223:9200", "10.0.0.224:9200"] # 指定ELK集群任意节点地址和端口，多个端口容错
+```
+
+
+
+# Logstash 过滤
+
+![image-20250316185029407](pic/image-20250316185029407.png)
+
+Logstash 是免费且开放的服务器端数据处理管道，能够从多个来源采集数据，转换数据，然后将数据发 送到您最喜欢的一个或多个“存储库”中
+
+Logstash 是整个ELK中拥有最丰富插件的一个组件,而且支持可以水平伸缩 
+
+Logstash 基于 Java 和 Ruby 语言开发
+
+[Logstash: Collect, Parse, Transform Logs | Elastic](https://www.elastic.co/logstash)
+
+*   输入 Input：用于日志收集,常见插件: Stdin、File、Kafka、Redis、Filebeat、Http 
+*   过滤 Filter：日志过滤和转换,常用插件: grok、date、geoip、mutate、useragent 
+*   输出 Output：将过滤转换过的日志输出, 常见插件: File,Stdout,Elasticsearch,MySQL,Redis,Kafka
+
+ Logstash 和 Filebeat 比
+
+*   Logstash 功能更丰富,可以支持直接将非Josn 格式的日志统一转换为Json格式,且支持多目标输出, 和filebeat相比有更为强大的过滤转换功能 
+*   Logstash 资源消耗更多,不适合在每个需要收集日志的主机上安装
 
 # Kibana图形显示
 
