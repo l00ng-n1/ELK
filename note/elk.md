@@ -431,6 +431,52 @@ LimitNPROC=65535          #修改打开最大的进程数，默认值为4096
 LimitMEMLOCK=infinity     
 ```
 
+## 冷热数据分离
+
+为了保证Elasticsearch的读写性能，官方建议磁盘使用SSD固态硬盘。然而Elasticsearch要解决的是海 量数据的存储和检索问题，海量的数据就意味需要大量的存储空间，如果都使用SSD固态硬盘成本将成 为一个很大的问题，这也是制约许多企业和个人使用Elasticsearch的因素之一。为了解决这个问题， Elasticsearch冷热分离架构应运而生。
+
+传统的Elasticsearch集群中所有节点均采用相同的配置，然而Elasticsearch并没有对节点的规格一致性 做要求，换而言之就是每个节点可以是任意规格，当然这样做会导致集群各节点性能不一致，影响集群 稳定性。但是如果有规则的将集群的节点分成不同类型，部分是高性能的节点用于存储热点数据，部分 是性能相对差些的大容量节点用于存储冷数据，却可以一方面保证热数据的性能，另一方面保证冷数据 的存储，降低存储成本，这也是Elasticsearch冷热分离架构的基本思想
+
+### 配置方法
+
+3热节点，2冷节点的冷热分离Elasticsearch集群
+
+![image-20250317092123199](pic/image-20250317092123199.png)
+
+### 指定节点的冷热属性
+
+```shell
+vim /etc/elasticsearch/elasticsearch.yml
+node.attr.{attribute}: {value}
+#其中attribute为用户自定义的任意标签名，value为该节点对应的该标签的值
+node.attr.temperature: hot //热节点
+node.attr.temperature: warm //冷节点
+```
+
+### 指定索引冷热属性
+
+用户可以在创建索引，或后续的任意时刻设置这些配置来控制索引在不同标签节点上的分配动作。
+
+```shell
+index.routing.allocation.include.{attribute} #表示索引可以分配在包含多个逗号分隔的值中其中一个的节点上。
+index.routing.allocation.require.{attribute} #表示索引要分配在包含索引指定多个逗号分隔的值的节点上,并且多个值都要匹配
+index.routing.allocation.exclude.{attribute} #表示索引只能分配在不包含指定多个逗号分隔的值的节点上。
+
+#对于热数据，索引设置如下
+PUT hot_warm_test_index/_settings
+{
+  "index.routing.allocation.require.temperature": "hot"
+}
+
+#对于冷数据，索引设置
+PUT hot_warm_test_index/_settings
+{
+  "index.routing.allocation.require.temperature": "warm"
+}
+```
+
+
+
 ## Elasticsearch面板
 
 ### Head插件
@@ -1204,7 +1250,316 @@ output.elasticsearch:
   hosts: ["10.0.0.222:9200", "10.0.0.223:9200", "10.0.0.224:9200"] # 指定ELK集群任意节点地址和端口，多个端口容错
 ```
 
+### 自定义索引名称收集日志到 ELasticsearch
 
+按天存索引，方便清理日志
+
+```shell
+filebeat.inputs:
+- type: log
+  json.keys_under_root: true
+  enabled: true                       #开启日志 
+  paths:
+  - /var/log/syslog                   #指定收集的日志文件
+  #include_lines: ['sshd','failed', 'password']  #只过滤指定包含关健字的日志
+  #include_lines: ['^ERR', '^WARN']   #只过滤指定包含关健字的日志
+  #exclude_lines: ['Debug']           #排除包含关健字的日志
+  #exclude_files: ['.gz$']            #排除文件名包含关健字的日志文件
+  
+output.elasticsearch:
+  hosts: ["10.0.0.222:9200"]        #指定ES集群服务器地址和端口
+  index: "ll-%{[agent.version]}-%{+yyyy.MM.dd}"
+  #注意: 8.X版生成的索引名为 .ds-wang-%{[agent.version]}-日期-日期-00000n
+  #注意：如果自定义索引名称，没有添加下面三行的配置会导致filebeat无法启动
+  
+setup.ilm.enabled: false  #关闭索引生命周期ilm功能，默认开启时索引名称只能为filebeat-*，自定义索引名必须修改为false
+setup.template.name: "ll" #定义模板名称,要自定义索引名称,必须指定此项,否则无法启动
+setup.template.pattern: "ll-*" #定义模板的匹配索引名称,要自定义索引名称,必须指定此项,否则无法启动
+
+setup.template.settings:
+  index.number_of_shards: 3
+  index.number_of_replicas: 1
+```
+
+### 收集 Nginx
+
+#### 利用 tags 收集 Nginx的 Json 格式访问日志和错误日志 到 Elasticsearch 不同的索引
+
+```shell
+apt update && apt -y install nginx
+
+vim /etc/nginx/nginx.conf
+http{
+			    log_format access_json '{"@timestamp":"$time_iso8601",'
+			    '"host":"$server_addr",'
+			    '"clientip":"$remote_addr",'
+			    '"size":$body_bytes_sent,'
+			    '"responsetime":$request_time,'
+			    '"upstreamtime":"$upstream_response_time",'
+			    '"upstreamhost":"$upstream_addr",'
+			    '"http_host":"$host",'
+			    '"uri":"$uri",'
+			    '"domain":"$host",'
+			    '"xff":"$http_x_forwarded_for",'
+			    '"referer":"$http_referer",'
+			    '"tcp_xff":"$proxy_protocol_addr",'
+			    '"http_user_agent":"$http_user_agent",'
+			    '"status":"$status"}';
+			    
+			    access_log  /var/log/nginx/access_json.log access_json ;
+    #access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+    
+    location / {
+        #try_files $uri $uri/ =404;       # 注释掉                                                 
+    }
+ 
+}
+```
+
+Filebeat 配置文件
+
+```shell
+vim /etc/filebeat/filebeat.yml
+filebeat.inputs:
+- type: log
+  json.keys_under_root: true
+  enabled: true                       
+  paths:
+  - /var/log/nginx/access_json.log                   
+  json.keys_under_root: true
+  json.overwrite_keys: true  #设为true,使用json格式日志中自定义的key替代默认的message字段,此项可选
+  tags: ["nginx-access"]     #指定tag,用于分类
+  
+- type: log
+  enabled: true
+  paths:
+  - /var/log/nginx/error.log
+  tags: ["nginx-error"]
+  
+output.elasticsearch:
+  hosts: ["10.0.0.222:9200"]        #指定ES集群服务器地址和端口
+  indices:
+    - index: "nginx-access-%{[agent.version]}-%{+yyy.MM.dd}" 
+      when.contains:
+        tags: "nginx-access" 
+    - index: "nginx-error-%{[agent.version]}-%{+yyy.MM.dd}"
+      when.contains:
+        tags: "nginx-error"
+  
+setup.ilm.enabled: false  
+setup.template.name: "nginx" 
+setup.template.pattern: "nginx-*" 
+
+setup.template.settings:
+  index.number_of_shards: 3
+  index.number_of_replicas: 1
+```
+
+#### 利用 fields 收集 Nginx的同一个访问日志中不同响应码 的行到 Elasticsearch 不同的索引
+
+```shell
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+  - /var/log/nginx/access.log
+  include_lines: ['404']  #文件中包含404的行
+  fields:
+    status_code: "404"
+
+- type: log
+  enabled: true
+  paths:
+  - /var/log/nginx/access.log
+  include_lines: ['200']    #文件中包含404的行
+  fields:
+    status_code: "200"
+
+- type: log
+  enabled: true
+  paths:
+  - /var/log/nginx/access.log
+  include_lines: ['304']
+  fields:
+    status_code: "304"
+    
+output.elasticsearch:
+  hosts: ["http://10.0.0.201:9200"]
+  indices:
+    - index: "myapp-error-404-%{+yyyy.MM.dd}"
+      when.equals:
+        fields.status_code: "404"
+    - index: "myapp-ok-200-%{+yyyy.MM.dd}"
+      when.equals:
+        fields.status_code: "200"
+    - index: "myapp-red-304-%{+yyyy.MM.dd}"
+      when.equals:
+        fields.status_code: "304"
+        
+setup.ilm.enabled: false
+setup.template:
+  enabled: true  #默认值，可选
+  name: "myapp"
+  pattern: "myapp-*"
+```
+
+### 收集Tomat
+
+#### 利用 Filebeat 收集 Tomat 的 Json 格式的访问日志和错 误日志到 Elasticsearch
+
+```shell
+apt update && apt -y install tomcat9 tomcat9-admin
+
+#修改 Tomcat 的访问日志为Json格式
+vim /etc/tomcat9/server.xml
+
+<Valve className="org.apache.catalina.valves.AccessLogValve" directory="logs" prefix="localhost_access_log" suffix=".txt" pattern="{&quot;clientip&quot;:&quot;%h&quot;,&quot;ClientUser&quot;:&quot;%l&quot;,&quot;authenticated&quot;:&quot;%u&quot;,&quot;AccessTime&quot;:&quot;%t&quot;,&quot;method&quot;:&quot;%r&quot;,&quot;status&quot;:&quot;%s&quot;,&quot;SendBytes&quot;:&quot;%b&quot;,&quot;Query?string&quot;:&quot;%q&quot;,&quot;partner&quot;:&quot;%{Referer}i&quot;,&quot;AgentVersion&quot;:&quot;%{User-Agent}i&quot;}"/>
+```
+
+Filebeat 配置文件
+
+```shell
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+  - /var/log/tomcat9/localhost_access_log.*
+  json.keys_under_root: true  
+  json.overwrite_keys: false 
+  tags: ["tomcat-access"]
+  
+- type: log
+  enabled: true
+  paths:
+  - /var/log/tomcat9/catalina.*.log       
+  tags: ["tomcat-error"]
+
+output.elasticsearch:
+  hosts: ["10.0.0.101:9200"]        
+  indices:
+    - index: "tomcat-access-%{[agent.version]}-%{+yyyy.MM.dd}" 
+      when.contains:
+        tags: "tomcat-access"
+    - index: "tomcat-error-%{[agent.version]}-%{+yyyy.MM.dd}"
+      when.contains:
+        tags: "tomcat-error"
+        
+setup.ilm.enabled: false 
+setup.template.name: "tomcat" 
+setup.template.pattern: "tomcat-*"
+setup.template.settings:
+  index.number_of_shards: 3
+  index.number_of_replicas: 1
+```
+
+#### 利用 Filebeat 收集 Tomat 的多行错误日志到 Elasticsearch
+
+Tomcat 是 Java 应用,当只出现一个错误时,会显示很多行的错误日志,如下所示
+
+Java 应用的一个错误导致生成的多行日志其实是同一个事件的日志的内容 
+
+而ES默认是根据每一行来区别不同的日志,就会导致一个错误对应多行错误信息会生成很多行的ES文档记 录 
+
+可以将一个错误对应的多个行合并成一个ES的文档记录来解决此问题
+
+[Manage multiline messages | Filebeat Reference [8.17\] | Elastic](https://www.elastic.co/guide/en/beats/filebeat/current/multiline-examples.html)
+
+```shell
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+    - /var/log/tomcat9/catalina.*.log #包安装
+  tags: ["tomcat-error"]
+  multiline.type: pattern            #此为默认值,可省略
+  multiline.pattern: '^[0-3][0-9]-'  #正则表达式匹配以两位,或者为'^\d{2}'
+  multiline.negate: true             #negate否定无效
+  multiline.match: after
+  multiline.max_lines: 5000          #默认只合并500行,指定最大合并5000行
+#格式2
+filebeat.inputs:
+- type: filestream
+  parsers:
+  - multiline:
+      type: pattern
+      pattern: '^[0-3][0-9]-'
+      negate: true
+      match: after
+```
+
+### Filebeat输出至 Redis
+
+```shell
+output.redis:
+  hosts: ["10.0.0.105:6379"]
+  password: "123456"
+  db: "0"
+  key: "filebeat" #所有日志都存放在key名称为filebeat的列表中，llen filebeat可查看长度，即日志记录数
+ #keys: #也可以用下面的不同日志存放在不同的key的形式
+ #  - key: "nginx_access"
+ #    when.contains:
+ #    tags: "access"
+ #  - key: "nginx_error"
+ #    when.contains:
+ #    tags: "error"
+```
+
+redis
+
+```shell
+apt -y install redis
+sed -i.bak '/^bind.*/c bind 0.0.0.0'  /etc/redis/redis.conf
+systemctl restart  redis
+
+redis-cli 
+127.0.0.1:6379> keys *
+1) "filebeat"
+127.0.0.1:6379> type filebeat
+list
+127.0.0.1:6379> llen filebeat
+(integer) 2097
+127.0.0.1:6379> LINDEX filebeat 2096
+```
+
+### Filebeat输出至 Kafka
+
+```shell
+output.kafka:
+  hosts: ["10.0.0.201:9092", "10.0.0.202:9092", "10.0.0.203:9092"]
+  topic: filebeat-log       #指定kafka的topic
+  partition.round_robin:
+    #true表示只发布到可用的分区，不可用分区就不发布，false 时表示所有分区，如果一个节点down，会block
+    reachable_only: true    
+  #如果为0，不启用确认机制，错误消息可能会丢失，1等待写入主分区（默认），-1等待写入副本分区
+  required_acks: 1          
+  compression: gzip  
+  max_message_bytes: 1000000 #每条消息最大长度，以字节为单位，如果超过将丢弃
+
+output.kafka:
+  hosts: ["localhost:9092"]
+  topic: "logs-%{[agent.version]}"
+  topics:
+    - topic: "critical-%{[agent.version]}"
+      when.contains:
+        message: "CRITICAL"
+    - topic: "error-%{[agent.version]}"
+      when.contains:
+        message: "ERR"
+```
+
+### Filebeat输出至 Logstash
+
+[Configure the Logstash output | Filebeat Reference [8.17\] | Elastic](https://www.elastic.co/guide/en/beats/filebeat/current/logstash-output.html)
+
+```shell
+output.logstash:
+  hosts: ["10.0.0.104:5044","10.0.0.105:5044"]
+  index: filebeat  
+  loadbalance: true     #默认为false,只随机输出至一个可用的logstash,设为true,则输出至全部logstash
+  worker: 1             #线程数量        
+  compression_level: 3  #压缩比
+```
 
 # Logstash 过滤
 
@@ -1226,6 +1581,371 @@ Logstash 基于 Java 和 Ruby 语言开发
 
 *   Logstash 功能更丰富,可以支持直接将非Josn 格式的日志统一转换为Json格式,且支持多目标输出, 和filebeat相比有更为强大的过滤转换功能 
 *   Logstash 资源消耗更多,不适合在每个需要收集日志的主机上安装
+
+## 安装
+
+8.X版本之后的logstash包已经内置了JDK无需安装
+
+```shell
+wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elastic-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/elastic-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main" | sudo tee -a /etc/apt/sources.list.d/elastic-8.x.list
+sudo apt-get update && sudo apt-get install logstash
+```
+
+或
+
+```shell
+wget https://artifacts.elastic.co/downloads/logstash/logstash-8.17.3-amd64.deb
+dpkg -i logstash-8.17.3-amd64.deb
+```
+
+##  Logstash 配置
+
+```shell
+vim /etc/logstash/logstash.yml
+node.name: logstash-node01
+pipeline.workers: 2
+pipeline.batch.size: 1000    #批量从IPNPUT读取的消息个数，可以根据ES的性能做性能优化
+pipeline.batch.delay: 5      #处理下一个事件前的最长等待时长，以毫秒ms为单位,可以根据ES的性能做性能优化
+path.data: /var/lib/logstash #默认值
+path.logs: /var/log/logstash #默认值
+
+#内存优化
+vim /etc/logstash/jvm.options
+-Xms1g
+-Xmx1g
+
+#Logstash默认以logstash用户运行,如果logstash需要收集本机的日志,可能会有权限问题,可以修改为root
+vim /lib/systemd/system/logstash.service
+[Service]
+User=root
+Group=root
+
+# 主pipeline
+cat /etc/logstash/pipelines.yml
+- pipeline.id: main
+  path.config: "/etc/logstash/conf.d/*.conf"
+  
+# /etc/logstash/conf.d/目录下存放子pipeline
+```
+
+## Logstash 使用
+
+### Logstash 命令
+
+```shell
+https://www.elastic.co/guide/en/logstash/current/first-event.html
+#各种插件
+https://www.elastic.co/guide/en/logstash/current/input-plugins.html
+https://www.elastic.co/guide/en/logstash/current/filter-plugins.html
+https://www.elastic.co/guide/en/logstash/current/output-plugins.html
+https://www.elastic.co/guide/en/logstash/7.6/input-plugins.html
+https://www.elastic.co/guide/en/logstash/7.6/filter-plugins.html
+https://www.elastic.co/guide/en/logstash/7.6/output-plugins.html
+```
+
+[Logstash Reference [8.17\] | Elastic](https://www.elastic.co/guide/en/logstash/current/index.html)
+
+```shell
+/usr/share/logstash/bin/logstash 
+#常用选项
+-e # 指定配置内容
+-f # 指定配置文件，支持绝对路径，如果用相对路径，是相对于/usr/share/logstash/的路径
+-t # 语法检查
+-r # 修改配置文件后自动加载生效,注意:有时候修改配置还需要重新启动生效
+
+# 列出所有插件
+/usr/share/logstash/bin/logstash-plugin list
+```
+
+[github Logstash Plugins](https://github.com/logstash-plugins)
+
+### Logstash 输入 Input 插件
+
+#### 标准输入输出
+
+codec 用于输入数据的编解码器，默认值为plain表示单行字符串，若设置为json，表示按照json方式解 析
+
+```shell
+#不支持Json格式输入
+/usr/share/logstash/bin/logstash  -e 'input { stdin{} } output { stdout{ codec => rubydebug }}'
+# 输入
+hello ll
+# 输出
+{
+    "@timestamp" => 2025-03-17T07:17:45.629451437Z,
+       "message" => "hello ll",
+         "event" => {
+        "original" => "hello ll"
+    },
+          "host" => {
+        "hostname" => "ubuntu-2204"
+    },
+      "@version" => "1"
+}
+```
+
+```shell
+# 支持Json格式输入
+/usr/share/logstash/bin/logstash -e 'input { stdin{ codec => json } } output { stdout{ }}'
+# 输入
+{ "name":"ll","age": "18","gender":"male"}
+# 输出
+{
+        "gender" => "male",
+    "@timestamp" => 2025-03-17T07:21:34.248315192Z,
+         "event" => {
+        "original" => "{ \"name\":\"ll\",\"age\": \"18\",\"gender\":\"male\"}\n"
+    },
+          "name" => "ll",
+          "host" => {
+        "hostname" => "ubuntu-2204"
+    },
+      "@version" => "1",
+           "age" => "18"
+}
+hello ll
+[WARN ] 2025-03-17 07:22:02.624 [[main]<stdin] jsonlines - JSON parse error, original data now in message field {:message=>"Unrecognized token 'hello': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 6]", :exception=>LogStash::Json::ParserError, :data=>"hello ll"}
+{
+    "@timestamp" => 2025-03-17T07:22:02.626771804Z,
+         "event" => {
+        "original" => "hello ll\n"
+    },
+          "host" => {
+        "hostname" => "ubuntu-2204"
+    },
+       "message" => "hello ll",
+      "@version" => "1",
+          "tags" => [
+        [0] "_jsonparsefailure"
+    ]
+}
+```
+
+```shell
+#添加tag和type
+/usr/share/logstash/bin/logstash  -e 'input { stdin{  tags => "stdin_tag"  type => "stdin_type" codec => json }  } output { stdout{  }}'
+# 输入
+{ "name":"ll","age": "18","gender":"male"}
+# 输出
+{
+         "event" => {
+        "original" => "{ \"name\":\"ll\",\"age\": \"18\",\"gender\":\"male\"}\n"
+    },
+        "gender" => "male",
+    "@timestamp" => 2025-03-17T07:24:50.753221355Z,
+          "name" => "ll",
+      "@version" => "1",
+          "type" => "stdin_type",
+          "tags" => [
+        [0] "stdin_tag"
+    ],
+          "host" => {
+        "hostname" => "ubuntu-2204"
+    },
+           "age" => "18"
+}
+```
+
+配置格式
+
+```shell
+vim /etc/logstash/conf.d/stdin2stdout.conf
+input {
+    stdin {
+        type => "stdin_type"  #自定义类型
+        tags => "stdin_tag"   #自定义tag
+        codec => "json"
+    }
+}
+
+output{
+    stdout {
+        codec => "rubydebug" #输出格式,此为默认值,可省略
+    }
+}
+
+# 语法检查
+/usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/stdin2stdout.conf -t
+
+#执行logstash,选项-r表示动态加载配
+/usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/stdin2stdout.conf -r
+# 输入
+{ "name":"ll","age": "18","gender":"male"}
+# 输出
+{
+    "@timestamp" => 2025-03-17T07:40:57.492464783Z,
+      "@version" => "1",
+          "tags" => [
+        [0] "stdin_tag"
+    ],
+          "host" => {
+        "hostname" => "ubuntu-2204"
+    },
+          "name" => "ll",
+        "gender" => "male",
+           "age" => "18",
+         "event" => {
+        "original" => "{ \"name\":\"ll\",\"age\": \"18\",\"gender\":\"male\"}\n"
+    },
+          "type" => "stdin_type"
+}
+```
+
+#### 从文件输入
+
+Logstash 会记录每个文件的读取位置,下次自动从此位置继续向后读取
+
+```shell
+vim /etc/logstash/conf.d/file2stdout.conf
+input {
+    file {
+        path => "/tmp/wang.*"
+        type => "wanglog"                     # 添加自定义的type字段,可以用于条件判断,和filebeat中tag功能相似
+        exclude => "*.txt"                    # 排除不采集数据的文件，使用通配符glob匹配语法
+        start_position => "beginning"         # 第一次从头开始读取文件,可以取值为:beginning和end,默认为end,即只从最后尾部读取日志
+        stat_interval => "3"                  # 定时检查文件是否更新，默认1s
+        codec => json                         # 如果文件是Json格式,需要指定此项才能解析,如果不是Json格式而添加此行也不会影响结果
+    }
+    
+    file {
+        path => "/var/log/syslog"
+        type => "syslog"
+        start_position => "beginning"
+        stat_interval => "3"
+    }
+
+}
+
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+
+# 语法检查
+/usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/file2stdout.conf -t
+
+#执行logstash,选项-r表示动态加载配
+/usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/file2stdout.conf -r
+echo '{ "name":"11", "age":"18" }' >> /tmp/wang.log
+{
+           "log" => {
+        "file" => {
+            "path" => "/tmp/wang.log"
+        }
+    },
+      "@version" => "1",
+           "age" => "18",
+          "name" => "11",
+          "type" => "wanglog",
+         "event" => {
+        "original" => "{ \"name\":\"11\", \"age\":\"18\" }"
+    },
+    "@timestamp" => 2025-03-17T07:51:02.739917383Z,
+          "host" => {
+        "name" => "ubuntu-2204"
+    }
+}
+```
+
+#### 从 Http 请求买取数据
+
+```shell
+vim /etc/logstash/conf.d/http2stdout.conf
+input {
+    http {
+        port => 6666
+        codec => json
+    }
+}
+
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+
+/usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/http2stdout.conf
+
+curl -X POST -d "This is a test data" 10.0.0.220:6666
+# 输出
+{
+           "url" => {
+          "path" => "/",
+        "domain" => "10.0.0.220",
+          "port" => 6666
+    },
+          "tags" => [
+        [0] "_jsonparsefailure"
+    ],
+    "@timestamp" => 2025-03-17T07:57:57.903190431Z,
+    "user_agent" => {
+        "original" => "curl/7.81.0"
+    },
+          "host" => {
+        "ip" => "10.0.0.220"
+    },
+          "http" => {
+        "request" => {
+            "mime_type" => "application/x-www-form-urlencoded",
+                 "body" => {
+                "bytes" => "19"
+            }
+        },
+         "method" => "POST",
+        "version" => "HTTP/1.1"
+    },
+      "@version" => "1",
+       "message" => "This is a test data"
+}
+
+curl -X POST -d '{"name":"ll", "age":"18"}' 10.0.0.220:6666
+# 输出
+{
+           "url" => {
+          "path" => "/",
+        "domain" => "10.0.0.220",
+          "port" => 6666
+    },
+          "host" => {
+        "ip" => "10.0.0.220"
+    },
+    "@timestamp" => 2025-03-17T07:58:49.359525508Z,
+    "user_agent" => {
+        "original" => "curl/7.81.0"
+    },
+          "name" => "ll",
+      "@version" => "1",
+         "event" => {
+        "original" => "{\"name\":\"ll\", \"age\":\"18\"}"
+    },
+          "http" => {
+        "request" => {
+            "mime_type" => "application/x-www-form-urlencoded",
+                 "body" => {
+                "bytes" => "25"
+            }
+        },
+         "method" => "POST",
+        "version" => "HTTP/1.1"
+    },
+           "age" => "18"
+}
+```
+
+http请求调试工具：
+
+*   postman
+*   insomnia [Download - Insomnia](https://insomnia.rest/download)
+
+#### 从 Filebeat 读取数据
+
+```shell
+vim /etc/logstash/conf.d/filebeat_to_stdout.conf
+```
+
+
 
 # Kibana图形显示
 
