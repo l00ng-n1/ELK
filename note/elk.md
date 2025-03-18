@@ -1182,7 +1182,7 @@ cat /tmp/filebeat.log-20250316.ndjson | jq
 
 ### 从FILE读取再输出至STDOUT
 
-filebeat 会将每个文件的读取数据的相关信息记录在`/var/lib/filebeat/registry/filebeat/log.json`文件中,可以实现日志采集的持续性,而不会重复采集
+filebeat 会将每个文件的读取数据的相关信息记录在`log.json`文件中,可以实现日志采集的持续性,而不会重复采集
 
 -   当日志文件大小发生变化时，filebeat会接着上一次记录的位置继续向下读取新的内容
 -   当日志文件大小没有变化，但是内容发生变化，filebeat会将文件的全部内容重新读取一遍
@@ -1941,8 +1941,472 @@ http请求调试工具：
 
 #### 从 Filebeat 读取数据
 
+filebeat配置
+
 ```shell
-vim /etc/logstash/conf.d/filebeat_to_stdout.conf
+vim /etc/filebeat/filebeat.yml 
+output.logstash:
+  hosts: ["10.0.0.220:5044"]             #指定Logstash服务器的地址和端口
+```
+
+logstash配置
+
+```shell
+vim /etc/logstash/conf.d/filebeat2stdout.conf
+input {
+    beats {
+       port => 5044
+    }
+}
+ 
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+
+/usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/filebeat2stdout.conf
+```
+
+#### 从 Redis 输入数据
+
+redis中数据被取走后，就没数据了
+
+```shell
+input {
+    redis {
+        host => '10.0.0.104'
+        port => "6379"
+        password => "123456"
+        db => "0"
+        data_type => 'list'
+        key => "filebeat"
+    }
+}
+
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+```
+
+Filebeat -> Redis -> Logstatsh
+
+#### 从 Kafka 中读取数据
+
+```shell
+input {
+    kafka {
+        bootstrap_servers => "10.0.0.201:9092,10.0.0.202:9092,10.0.0.203:9092"
+        group_id => "logstash" #多个logstash的group_id如果不同，将实现消息共享（发布者/订阅者模式），如果相同（建议使用），则消息独占（生产者/消费者模式）
+        topics => ["nginx-accesslog","nginx-errorlog"]
+        codec => "json"
+        consumer_threads => 8
+    }
+}
+
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+```
+
+Filebeat -> Kafka -> Logstash
+
+#### 从 syslog 输入数据
+
+```shell
+input {
+    syslog {
+        host => "0.0.0.0"
+        port => "514"       # 指定监听的UDP/TCP端口，注意普通用户无法监听特权端口（0-1024）
+        type => "haproxy"
+    }
+}
+
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+
+logger -p local6.info -n  <logstash地址>  "This is a test log"
+```
+
+####  从TCP/UDP 输入数据
+
+```
+input {
+    tcp {
+        port => "9527"
+        host => "0.0.0.0"
+        type => "tcplog"
+        codec => json
+        mode => "server"
+    }
+}
+
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+
+nc 10.0.0.106 9527
+hello, test
+```
+
+### Logstash 过滤 Filter 插件
+
+常见的 Filter 插件:
+
+-   利用 **Grok** 从非结构化数据中转化为结构数据
+-   利用 GEOIP 根据 IP 地址找出对应的地理位置坐标
+-   利用 useragent 从请求中分析操作系统、设备类型
+-   利用 Mutate 从请求中整理字段
+
+#### Grok 插件
+
+将日志行与格式匹配, 生产环境常需要将非结构化的数据解析成 json 结构化数据格式
+
+Grok 非常适合将syslog 日志、apache 和其他 web 服务器日志、MySQL 日志等日志格式转换为JSON格 式。
+
+**转化为grok格式，直接问CHATGPT**
+
+将 Nginx 日志格式化为 json 格式
+
+```shell
+# nginx中的一条日志
+58.250.250.21 - - [14/Jul/2020:15:07:27 +0800] "GET /wp-content/plugins/akismet/_inc/form.js?ver=4.1.3 HTTP/1.1" 200 330 "http://www.wangxiaochun.com/?p=117" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36" "-"
+```
+
+```shell
+input {
+    tcp {
+        port => "9527"
+        host => "0.0.0.0"
+        type => "tcplog"
+        codec => json
+        mode => "server"
+    }
+}
+
+
+filter {
+    grok {
+        match => {
+            # TIME匹配的值，作为timestamp这个健的值，WORD的值，作为log_level这个健的值...
+            "message" => "%{COMBINEDAPACHELOG}"
+        }
+    }
+}
+
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+```
+
+自定义匹配
+
+[GROK的模式说明以及常用语法_日志服务(SLS)-阿里云帮助中心](https://help.aliyun.com/zh/sls/user-guide/grok-patterns#section-dwq-6dr-cn9)
+
+```shell
+mkdir -p /etc/logstash/patterns
+vim /etc/logstash/patterns/ufw
+UFW_LOG %{SYSLOGTIMESTAMP:timestamp} %{SYSLOGHOST:host} kernel: \[%{NUMBER:uptime:float}\] \[%{DATA:ufw_action}\] IN=%{WORD:interface} (OUT=%{WORD:out_interface}|OUT=) MAC=%{DATA:src_dst_mac} SRC=%{IPV4:src_ip} DST=%{IPV4:dst_ip} LEN=%{NUMBER:packet_length:int} TOS=%{DATA:tos} PREC=%{DATA:prec} TTL=%{NUMBER:ttl:int} ID=%{NUMBER:id:int} PROTO=%{WORD:protocol} SPT=%{NUMBER:src_port:int} DPT=%{NUMBER:dst_port:int} WINDOW=%{NUMBER:window:int} RES=%{DATA:res} %{WORD:tcp_flags} URGP=%{NUMBER:urgp:int}
+
+UFW_SRC_DPT %{SYSLOGTIMESTAMP:timestamp} %{SYSLOGHOST} kernel: .* SRC=%{IPV4:src_ip} .* DPT=%{NUMBER:dst_port:int} .*  
+
+vim /etc/logstash/conf.d/grok.yml
+
+filter {
+  grok {
+    patterns_dir => ["/etc/logstash/patterns"]
+    match => { "message" => "%{UFW_LOG}" }
+  }
+}
+
+# 测试数据
+Mar 16 00:00:35 loong kernel: [8753844.748750] [UFW BLOCK] IN=eth0 OUT= MAC=00:16:3c:9f:f4:e5:00:17:df:b3:a8:00:08:00 SRC=194.180.49.251 DST=148.135.6.161 LEN=40 TOS=0x08 PREC=0x20 TTL=235 ID=55260 PROTO=TCP SPT=51776 DPT=19192 WINDOW=1024 RES=0x00 SYN URGP=0 
+
+/usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/grok.yml
+{
+           "uptime" => 8753844.74875,
+            "event" => {
+        "original" => "Mar 16 00:00:35 loong kernel: [8753844.748750] [UFW BLOCK] IN=eth0 OUT= MAC=00:16:3c:9f:f4:e5:00:17:df:b3:a8:00:08:00 SRC=194.180.49.251 DST=148.135.6.161 LEN=40 TOS=0x08 PREC=0x20 TTL=235 ID=55260 PROTO=TCP SPT=51776 DPT=19192 WINDOW=1024 RES=0x00 SYN URGP=0\n"
+    },
+             "tags" => [
+        [0] "_jsonparsefailure"
+    ],
+           "dst_ip" => "148.135.6.161",
+              "tos" => "0x08",
+         "dst_port" => 19192,
+        "timestamp" => "Mar 16 00:00:35",
+       "@timestamp" => 2025-03-18T05:27:15.492115155Z,
+         "@version" => "1",
+        "tcp_flags" => "SYN",
+             "prec" => "0x20",
+          "message" => "Mar 16 00:00:35 loong kernel: [8753844.748750] [UFW BLOCK] IN=eth0 OUT= MAC=00:16:3c:9f:f4:e5:00:17:df:b3:a8:00:08:00 SRC=194.180.49.251 DST=148.135.6.161 LEN=40 TOS=0x08 PREC=0x20 TTL=235 ID=55260 PROTO=TCP SPT=51776 DPT=19192 WINDOW=1024 RES=0x00 SYN URGP=0",
+              "res" => "0x00",
+         "protocol" => "TCP",
+        "interface" => "eth0",
+    "packet_length" => 40,
+           "window" => 1024,
+             "urgp" => 0,
+       "ufw_action" => "UFW BLOCK",
+           "src_ip" => "194.180.49.251",
+      "src_dst_mac" => "00:16:3c:9f:f4:e5:00:17:df:b3:a8:00:08:00",
+              "ttl" => 235,
+             "host" => {
+        "hostname" => "ubuntu-2204"
+    },
+               "id" => 55260,
+         "src_port" => 51776
+}
+```
+
+#### GeoIP 插件
+
+geoip 根据 ip 地址提供的对应地域信息，比如:经纬度,国家,城市名等,以方便进行地理数据分析
+
+```shell
+filter {
+    grok {
+        match => {
+            match => { "message" => "%{UFW_SRCIP}" }
+        }
+
+    geoip {
+        # 新版的database字段必须添加
+        database => "/usr/share/logstash/vendor/bundle/jruby/3.1.0/gems/logstash-filter-geoip-7.3.1-java/vendor/GeoLite2-City.mmdb"
+        source => "src_ip"
+        target => "geoip"
+    }
+}
+```
+
+#### Date 插件
+
+Date插件可以将日志中的指定的日期字符串对应的源字段生成新的目标字段。
+
+然后替换@timestamp 字段(此字段默认为当前写入logstash的时间而非日志本身的时间)或指定的其他 字段
+
+```shell
+filter {
+    grok {
+        match => {
+            match => { "message" => "%{UFW_SRCIP}" }
+        }
+        
+    #解析源字段timestamp的date日期格式: 14/Jul/2020:15:07:27 +0800
+    date {
+        match => ["timestamp", "dd/MMM/yyyy:HH:mm:ss Z" ] # 这里的时间格式必须和timestamp的实际格式匹配
+        target => "access_time"         #将时间写入新生成的access_time字段，源字段仍保留
+        #target => "@timestamp"         #将时间覆盖原有的@timestamp字段
+        timezone => "Asia/Shanghai"
+       }
+       
+     # Mar 16 00:02:50
+    date {
+        match => ["timestamp", "MMM dd HH:mm:ss" ] # 这里的时间格式必须和timestamp的实际格式匹配
+        target => "access_time"         #将时间写入新生成的access_time字段，源字段仍保留
+        #target => "@timestamp"         #将时间覆盖原有的@timestamp字段
+        timezone => "Asia/Shanghai"
+       } 
+}
+```
+
+#### Useragent 插件
+
+useragent 插件可以根据请求中的 user-agent 字段，解析出浏览器设备、操作系统等信息, 以方便后续的分析使用
+
+```shell
+filter {
+    #将nginx日志格式化为json格式
+    grok {
+        match => {
+            "message" => "%{COMBINEDAPACHELOG}" }
+        }
+    }
+    #解析date日期如: 10/Dec/2020:10:40:10 +0800
+    date {
+        match => ["timestamp", "dd/MMM/yyyy:HH:mm:ss Z" ]
+        target => "@timestamp"
+        #target => "access_time"
+        timezone => "Asia/Shanghai"
+    }
+    #提取agent字段，进行解析
+    useragent {
+        #source => "agent"                    #7,X指定从哪个字段获取数据
+        source => "message"                   #8.X指定从哪个字段获取数据
+        #source => "[user_agent][original]"   #8.X指定从哪个字段获取数据,直接分析日志文件，curl或insomnia此方式不成功
+        #source => "[user_agent][original][1]" #8.X指定从哪个字段获取数据，如果利用insomnia此方式不成功工具发送http请求，需要加[1]
+        target => "useragent" #指定生成新的字典类型的字段的名称，包括os，device等内容
+    }
+}
+```
+
+#### Mutate 插件
+
+ Mutate 插件主要是对字段进行、类型转换、删除、替换、更新等操作,可以使用以下函数
+
+```shell
+remove_field   #删除字段
+split          #字符串切割,相当于awk取列
+add_field      #添加字段    
+convert        #字符串替换
+gsub           #类型转换，支持的数据类型：integer，integer_eu，float，float_eu，string，boolean 
+rename         #字符串改名
+lowercase      #转换字符串为小写 
+```
+
+```shell
+filter {
+    # 删除指定字段
+    mutate {
+        remove_field => ["timestamp", "message"]
+    }
+    
+    # 以|为分隔符，分隔字段
+    mutate {
+        split => {"message" => "|"}
+    }
+    
+    mutate {
+        # 添加字段，将message的列表的第0个元素添加字段名user_id...
+        add_field => {
+            "user_id" => "%{[message][0]}"
+            "action" => "%{[message][1]}"
+            "time" => "%{[message][2]}"
+        }
+        # 添加字段做索引名
+        # add_field => {"[@metadata][target_index]" => "app-%{+YYY.MM.dd}"}
+    }
+    
+    mutate{
+        # 数据类型转换
+        convert => {
+            "user_id" => "integer"
+            "action" => "string"
+            "time" => "string"
+        }
+    }
+    
+    mutate {
+        gsub=>["message","/n", " "] #将message字段中的换行替换为空格
+    }
+    
+    
+}
+```
+
+### 条件判断
+
+```shell
+# 
+filter {
+    if "access" in [tags][0] {
+        mutate {
+            add_field => {"target_index" => "access-%{+YYYY.MM.dd}"}
+        }
+    }
+    else if "error" in [tags][0] {
+        mutate {
+            add_field => {"target_index" => "error-%{+YYYY.MM.dd}"}
+        }
+    }
+    else if "system" in [tags][0] {
+        mutate {
+            add_field => {"target_index" => "system-%{+YYYY.MM.dd}"}
+        }
+    }
+
+}
+
+output {
+    if [fields][env] == "test" {
+        elasticsearch {
+            hosts => ["10.0.0.100:9200","10.0.0.101:9200","10.0.0.102:9200"]
+            index => "test-nginx-%{+YYYY.MM.dd}"
+        }
+    }
+    if [type] == "mysticallog" {
+        stdout {
+            codec => rubydebug
+        }
+    }
+}
+```
+
+### Logstash 输出 Output插件
+
+#### stdout 插件
+
+```shell
+output {
+    stdout {
+        codec => rubydebug
+    }
+}
+```
+
+#### File 插件
+
+输出到文件，可以将分散在多个文件的数据统一存放到一个文件
+
+```shell
+output {
+    stdout {
+        codec => rubydebug
+    }
+    file {
+        path => "/var/log/test.log"
+    }
+}
+```
+
+#### Elasticsearch 插件
+
+```shell
+output {
+    elasticsearch {
+        hosts => ["10.0.0.100:9200", "10.0.0.101:9200", "10.0.0.102:9200"]  # 一般写ES中data节点地址
+        index => "app-%{+YYYY.MM.dd}"               # 指定索引名称，建议加时间，按天建立索引
+        # index => "%{[@metadata][target_index]}"   # 使用字段[metadata][target_index]值做为索引名
+        template_overwrite => true                  # 覆盖索引模版，此项可选，默认值为false
+    }
+}
+```
+
+#### Redis 插件
+
+```shell
+output {
+    redis {
+        host => 'Redis_IP'
+        port => "6379"
+        password => "123456"
+        db => "0"
+        data_type => 'list'
+        key => "nginx-accesslog"
+    }
+}
+```
+
+#### Kafka 插件
+
+```shell
+output {
+    kafka {
+       bootstrap_server => '10.0.0.105:9092,10.0.0.107:9092,10.0.0.108:9092'
+       topic_id => 'nginx-accesslog'
+       codec => 'json'   # 如果是Json格式，需要标识的字段
+    }
+}
 ```
 
 
@@ -1969,7 +2433,7 @@ sudo dpkg -i kibana-8.17.3-amd64.deb
 useradd -r -s /sbin/nologin kibana
 ```
 
-配置
+### 配置
 
 ```shell
 vim /etc/kibana/kibana.yml
@@ -2086,5 +2550,34 @@ GET /index_wang/_doc/1
 
 ![image-20250315200707082](pic/image-20250315200707082.png)
 
+## Kibana 可视化画图功能
 
+Kibana支持多种图形展示功能，需要日志是json格式的支持
 
+### lens 可视化
+
+垂直条形图
+
+水平条形图
+
+![image-20250318163755156](pic/image-20250318163755156.png)
+
+表
+
+markdown
+
+![image-20250318163918765](pic/image-20250318163918765.png)
+
+指标
+
+热力图
+
+面积图
+
+饼状图
+
+线图 Line Chart
+
+标签云图
+
+地图
